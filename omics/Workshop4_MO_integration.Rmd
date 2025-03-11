@@ -1,0 +1,518 @@
+---
+title: "Workshop 4: Multi-omics integration methods"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+### Load packages
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(data.table)
+library(devtools)
+library(compGenomRData) # devtools::install_github("compgenomr/compGenomRData")
+library(pheatmap)
+library(FactoMineR) # install.packages("FactoMineR")
+library(NMF) # install.packages("NMF")
+library(iClusterPlus) # BiocManager::install("iClusterPlus")
+library(mixOmics) #BiocManager::install("mixOmics")
+```
+
+
+# Pre-processing of data
+
+The data concerns 121 tumors from the TCGA (Weinstein, Collisson, Mills, et al. 2013) colorectal cancer cohort.
+The tumors have been profiled for gene expression using RNA-seq, mutations using Exome-seq, and copy number variations using genotyping arrays. 2 tumors arise in the colon, they may have distinct molecular profiles, which is important for treatment decisions. The subset of tumors used belong to two distinct molecular subtypes : CMS1 and CMS3. 
+
+```{r}
+# read in the csv from the companion package as a data frame
+csvfile <- system.file("extdata", "multi-omics", "COREAD_CMS13_gex.csv", 
+                       package="compGenomRData")
+
+x1 <- read.csv(csvfile, row.names=1)
+# Fix the gene names in the data frame
+rownames(x1) <- sapply(strsplit(rownames(x1), "\\|"), function(x) x[1])
+# Output a table
+knitr::kable(head(t(head(x1))), caption="Example gene expression data")
+```
+
+The rows correspond to patients, referred to by their TCGA identifier, as the first column of the table.
+Columns represent the genes, and the values are RPKM expression values. The column names are the names or symbols of the genes.
+
+
+We first read **mutation data**.
+
+```{r}
+# read in the csv from the companion package as a data frame
+csvfile <- system.file("extdata", "multi-omics", "COREAD_CMS13_muts.csv", 
+                       package="compGenomRData")
+x2 <- read.csv(csvfile, row.names=1)
+# Set mutation data to be binary (so if a gene has more than 1 mutation,
+# we only count one)
+x2[x2>0]=1
+# output a table
+knitr::kable(head(t(head(x2))), caption="Example mutation data")
+```
+
+In the mutation matrix, each cell is a binary 1/0, indicating whether or not a tumor has a non-synonymous mutation in the gene indicated by the column. These types of mutations change the aminoacid sequence, therefore they are likely to change the function of the protein.
+
+
+Next, we read **copy number data**.
+
+```{r}
+# read in the csv from the companion package as a data frame
+csvfile <- system.file("extdata", "multi-omics", "COREAD_CMS13_cnv.csv", 
+                       package="compGenomRData")
+x3 <- read.csv(csvfile, row.names=1)
+# output a table
+knitr::kable(head(t(head(x3))), 
+             caption="Example copy number data for CRC samples")
+```
+
+
+During transformation from healthy cells to cancer cells, the genome sometimes undergoes large-scale instability; large segments of the genome might be replicated or lost. This will be reflected in each segment’s “copy number”. In this matrix, each column corresponds to a chromosome segment, and the value of the cell is a real-valued score indicating if this segment has been amplified (copied more) or lost, relative to a non-cancer control from the same patient.
+
+
+Each of the data types (gene expression, mutations, copy number variation) on its own, provides some signal which allows us to somewhat separate the samples into the two different subtypes. In order to explore these relations, we must first obtain the subtypes of these tumors. 
+
+```{r}
+# read in the csv from the companion package as a data frame
+csvfile <- system.file("extdata", "multi-omics", "COREAD_CMS13_subtypes.csv",
+                       package="compGenomRData")
+covariates <- read.csv(csvfile, row.names=1)
+# Fix the TCGA identifiers so they match up with the omics data
+rownames(covariates) <- gsub(pattern = '-', replacement = '\\.',
+                             rownames(covariates))
+covariates <- covariates[colnames(x1),]
+# create a dataframe which will be used to annotate later graphs
+anno_col <- data.frame(cms=as.factor(covariates$cms_label))
+rownames(anno_col) <- rownames(covariates)
+```
+
+Before proceeding with any multi-omics integration analysis which might obscure the underlying data, it is important to take a look at each omic data type on its own, and in this case in particular, to examine their relation to the underlying condition, i.e. the cancer subtype. A great way to get an eagle-eye view of such large data is using heatmaps.
+
+We will first check the gene expression data in relation to the subtypes. One way of doing that is plotting a heatmap and clustering the tumors.
+
+```{r}
+pheatmap(x1,
+         annotation_col = anno_col,
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         main="Gene expression data")
+```
+
+**What do you have in column on this heatmap ? In row ?**
+
+Next we repeat the same exercise using the **mutation data**.
+
+```{r}
+pheatmap(x2,
+         annotation_col = anno_col,
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         main="Mutation data")
+```
+
+**Interpret the heatmap. Does the number of mutations appear to be the same in the 2 tumors?**
+
+
+Finally, we look into **copy number variation data** and try to see if clustered samples are in concordance with subtypes. 
+
+```{r}
+pheatmap(x3,
+         annotation_col = anno_col,
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         main="Copy number data")
+```
+
+**Interpret the heatmap.**
+
+#  Method 1: Multiple factor analysis
+
+Multiple factor analysis is a natural starting point for a discussion about matrix factorization methods for integrating multiple data types. It is a straightforward extension of PCA into the domain of multiple data types.
+
+```{r}
+# run the MFA function from the FactoMineR package
+r.mfa <- FactoMineR::MFA(
+  t(rbind(x1,x2,x3)), # binding the omics types together
+  c(dim(x1)[1], dim(x2)[1], dim(x3)[1]), # specifying the dimensions of each
+  graph=FALSE)
+```
+
+Since this generates a two-dimensional factorization of the multi-omics data, we can now plot each tumor as a dot in a 2D scatter plot to see how well the MFA factors separate the cancer subtypes. 
+
+```{r}
+# first, extract the H and W matrices from the MFA run result
+mfa.h <- r.mfa$global.pca$ind$coord
+mfa.w <- r.mfa$quanti.var$coord
+
+# create a dataframe with the H matrix and the CMS label
+mfa_df <- as.data.frame(mfa.h)
+mfa_df$subtype <- factor(covariates[rownames(mfa_df),]$cms_label)
+
+# create the plot
+mfa_df %>%
+  ggplot(aes(x=Dim.1, y=Dim.2, color=subtype)) +
+  geom_point() + 
+  scale_color_manual(values = c("#d00000", "#3a86ff")) +
+  ggtitle("Scatter plot of MFA") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+**What do you observe ?**
+
+
+Another way to examine the MFA factors is a heatmap.
+
+```{r}
+pheatmap(t(mfa.h)[1:2,],
+         annotation_col = anno_col,
+         show_colnames = FALSE,
+         main="MFA for multi-omics integration")
+```
+
+**Interpret the heatmap.**
+
+
+# Method 2: Joint non-negative matrix factorization (NMF)
+
+NMF decomposes multi-omics datasets into non-negative matrices representing underlying patterns or features shared across various biological layers. By enforcing non-negativity constraints, Joint NMF ensures that the extracted components are biologically interpretable.
+
+```{r}
+split_neg_columns <- function(x) {
+    new_cols <- list() #Create an empty list to store new columns
+    
+    # For each column in the original data frame
+    for(i in 1:ncol(x)) {
+      
+      #Create a new column with positive values (original values if positive, 0 otherwise)
+      new_cols[[paste0(colnames(x)[i],'+')]] <- sapply(X = x[,i], function(x) max(0,x))
+      
+      # Create a new column with negative values (original values if negative, 0 otherwise)  
+      new_cols[[paste0(colnames(x)[i],'-')]] <- sapply(X = -x[,i],function(x) max(0,x))
+    }
+    
+    #new_cols
+    # Combine the new columns into a new data frame
+    return(do.call(cbind, new_cols)) 
+}
+```
+
+
+```{r}
+# Feature-normalize the data
+x1.featnorm <- x1 / rowSums(x1)
+x2.featnorm <- x2 / rowSums(x2)
+x3.featnorm <- x3 / rowSums(x3)
+
+# Normalize by each omics type's frobenius norm
+x1.featnorm.frobnorm <- x1.featnorm / norm(as.matrix(x1.featnorm), type="F")
+x2.featnorm.frobnorm <- x2.featnorm / norm(as.matrix(x2.featnorm), type="F")
+x3.featnorm.frobnorm <- x3.featnorm / norm(as.matrix(x3.featnorm), type="F")
+
+# Split the features of the CNV matrix into two non-negative features each
+x3.featnorm.frobnorm.nonneg <- t(split_neg_columns(t(x3.featnorm.frobnorm)))
+```
+
+
+```{r}
+r.nmf <- nmf(t(rbind(x1.featnorm.frobnorm,
+                     x2.featnorm.frobnorm,
+                     x3.featnorm.frobnorm.nonneg)),
+             2,
+             method='Frobenius')
+
+# exctract the H and W matrices from the nmf run result
+nmf.h <- NMF::basis(r.nmf)
+nmf.w <- NMF::coef(r.nmf)
+nmfw <- t(nmf.w)
+```
+
+As with MFA, we can examine how well 2-factor NMF splits tumors into subtypes by looking at the scatter plot.
+
+```{r}
+# create a dataframe with the H matrix and the CMS label (subtype)
+nmf_df <- as.data.frame(nmf.h)
+colnames(nmf_df) <- c("dim1", "dim2")
+nmf_df$subtype <- factor(covariates[rownames(nmf_df),]$cms_label)
+
+# create the scatter plot
+nmf_df %>%
+  ggplot(aes(x=dim1, y=dim2, color=subtype)) +
+  geom_point() +
+  ggtitle("Scatter plot of 2-component NMF for multi-omics integration") +
+  scale_color_manual(values = c("#d00000", "#3a86ff")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+**What does this plot show ? Is there a difference between NMF and MFA?**
+
+
+Again, we can do an heatmap.
+
+```{r}
+pheatmap(t(nmf_df[,1:2]),
+         annotation_col = anno_col,
+         show_colnames=FALSE,
+         main="Heatmap of 2-component NMF")
+```
+
+# Method 3: ICluster
+
+ICluster+ extends the capabilities of ICluster. It employs a robust probabilistic framework for integrative clustering. By jointly modeling dependencies and interactions among different data modalities, ICluster+ allows the uncover of cohesive patterns and relationships within heterogeneous biological datasets, it allows the identification of cross-omics clusters, facilitating a more comprehensive understanding of the interconnected molecular features. This integration enables the reveal of intricate relationships and the identification of shared regulatory networks.
+
+```{r}
+# run the iClusterPlus function
+r.icluster <- iClusterPlus::iClusterPlus(
+  t(x1), # Providing each omics type
+  t(x2),
+  t(x3),
+  type=c("gaussian", "binomial", "multinomial"), # Providing the distributions
+  K=2, # provide the number of factors to learn
+  alpha=c(1,1,1), # as well as other model parameters
+  lambda=c(.03,.03,.03))
+
+# extract the H and W matrices from the run result
+# here, we refer to H as z, to keep with iCluster terminology
+icluster.z <- r.icluster$meanZ
+rownames(icluster.z) <- rownames(covariates) # fix the row names
+icluster.ws <- r.icluster$beta
+
+# construct a dataframe with the H matrix (z) and the cancer subtypes
+# for later plotting
+icp_df <- as.data.frame(icluster.z)
+colnames(icp_df) <- c("dim1", "dim2")
+rownames(icp_df) <- colnames(x1)
+icp_df$subtype <- factor(covariates[rownames(icp_df),]$cms_label)
+```
+
+
+As with other methods, we examine the iCluster results by looking at the scatter plot and the heatmap.
+
+```{r}
+icp_df %>%
+  ggplot(aes(x=dim1, y=dim2, color=subtype)) +
+  geom_point() +
+  ggtitle("Scatter plot of iCluster+ factors") +
+  scale_color_manual(values = c("#d00000", "#3a86ff")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+**What dimension can we use to distinguish the two groups?**
+
+```{r}
+pheatmap(t(icp_df[,1:2]),
+         annotation_col = anno_col, 
+         show_colnames = FALSE,
+         border_color = NA,
+         main="Heatmap of iCluster+ factors")
+```
+
+**Are your conclusions confirmed by the heatmap?**
+
+
+# Method 4: MixOmics
+
+MixOmics is a statistical method tailored to extract meaningful patterns from complex and diverse molecular datasets. MixOmics employs integrative approaches such as Canonical Correlation Analysis (CCA) and multiblock Partial Least Squares (mbPLS) to simultaneously analyze multiple omics layers. It enables to identify shared biological structures, unravel inter-omics relationships, and pinpoint key features contributing to the observed variability. MixOmics is particularly adept at characterizing the intricate crosstalk between different molecular dimensions, providing a holistic view of biological systems.
+
+## Part 1: with stem cells data
+
+```{r}
+data(stemcells) # extract stem cells data
+
+X <- stemcells$gene # use genetic expression levels as predictors
+Y <- stemcells$celltype # use stem cell type as response
+study <- stemcells$study # extract study allocation of samples
+```
+
+```{r}
+optimal.ncomp <- 2 
+
+splsda.tune <- tune(X = X,
+                    Y = Y,
+                    study = study,  # tune the number of features
+                    ncomp = optimal.ncomp,# using optimal comp number
+                    test.keepX = seq(1, 100, 1), 
+                    method = 'mint.splsda',
+                    measure = 'BER', # balanced error rate
+                    dist = "centroids.dist")
+
+optimal.keepX <- splsda.tune$choice.keepX # extract optimal values
+
+final.splsda.model <- mint.splsda(X = X, Y = Y,
+                                  study = study, 
+                                  ncomp = optimal.ncomp, 
+                                  keepX = optimal.keepX)
+```
+
+```{r}
+# For component 1
+selected_vars <- selectVar(final.splsda.model, comp = 1)
+plotLoadings(final.splsda.model, method = 'mean', contrib = 'max', comp = 1)
+```
+
+```{r}
+# For component 2
+selected_vars <- selectVar(final.splsda.model, comp = 2)
+plotLoadings(final.splsda.model, method = 'mean', contrib = 'max', comp = 2)
+```
+
+**Interpret loading plots. What is the significance of the bars and their colors?**
+
+
+## Part 2: with breast TCGA data
+
+```{r}
+data(breast.TCGA) # load in the data
+
+# set a list of all the X dataframes
+data = list(miRNA = breast.TCGA$data.train$mirna, 
+            mRNA = breast.TCGA$data.train$mrna,
+            proteomics = breast.TCGA$data.train$protein)
+
+lapply(data, dim) # check their dimensions
+```
+
+```{r}
+Y = breast.TCGA$data.train$subtype # set the response variable as the Y df
+summary(Y)
+```
+
+### DIABLO model
+
+The moderate to high correlation between these features means that an appropriate value for the design matrix would be about ~0.8 – 0.9. However, values above 0.5 will cause a reduction in predictive ability of the model – and prediction is what is desired in this context. Hence, a value of 0.1 will be used to prioritise the discriminative ability of the model.
+
+```{r}
+## for square matrix filled with 0.1s
+design = matrix(0.1, ncol = length(data), nrow = length(data), 
+                dimnames = list(names(data), names(data)))
+diag(design) = 0 # set diagonal to 0s
+
+design
+```
+With a design in place, the initial DIABLO model can be generated. An arbitrarily high number of components (ncomp = 5) will be used.
+
+```{r}
+# form basic DIABLO model
+basic.diablo.model = block.splsda(X = data, Y = Y, ncomp = 5, design = design) 
+```
+
+* **Tuning the number of components**
+
+To choose the number of components for the final DIABLO model, the function perf() is run with 10-fold cross-validation repeated 10 times.
+
+```{r}
+# run component number tuning with repeated CV
+perf.diablo = perf(basic.diablo.model, validation = 'Mfold', 
+                   folds = 10, nrepeat = 10) 
+
+plot(perf.diablo) # plot output of tuning
+```
+
+From the performance plot above, we observe that both overall and balanced error rate (BER) decrease from 1 to 2 components. The standard deviation indicates a potential slight gain in adding more components. The centroids.dist distance seems to give the best accuracy. Considering this distance and the BER, the output $choice.ncomp indicates the optimal number of components for the final DIABLO model.
+
+```{r}
+# set the optimal ncomp value
+ncomp = perf.diablo$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"] 
+# show the optimal choice for ncomp for each dist metric
+perf.diablo$choice.ncomp$WeightedVote 
+```
+
+* **Tuning the number of features**
+
+This tuning function should be used to tune the keepX parameters in the *block.splsda()* function.
+
+We choose the optimal number of variables to select in each data set using the *tune.block.splsda()* function, for a grid of keepX values for each type of omics. Note that the function has been set to favour a relatively small signature while allowing us to obtain a sufficient number of variables for downstream validation and/or interpretation.
+
+The function tune is run with 10-fold cross validation, but repeated only once. Note that for a more thorough tuning process, provided sufficient computational time, we could increase the nrepeat argument. Results are available into an RData object as the tuning can take a very long time, especially on lower end machines.
+
+```{r}
+# # set grid of values for each component to test
+test.keepX = list (mRNA = c(5:9, seq(10, 18, 2), seq(20,30,5)), miRNA = c(5:9,
+seq(10, 18, 2), seq(20,30,5)), proteomics = c(5:9, seq(10, 18, 2),
+seq(20,30,5)))
+# 
+# # run the feature selection tuning
+# tune.TCGA = tune.block.splsda(X = data, Y = Y, ncomp = ncomp, 
+#                               test.keepX = test.keepX, design = design,
+#                               validation = 'Mfold', folds = 10, nrepeat = 1,
+#                               dist = "centroids.dist")
+
+######
+# OR #
+######
+
+tune.TCGA <- readRDS("C:\\Users\\praba\\Documents\\GitHub\\UCA-M2-SEMESTER2\\omics\\tune.TCGA.RDS")
+```
+
+The number of features to select on each component is returned in tune.TCGA$choice.keepX.
+
+```{r}
+list.keepX = tune.TCGA$choice.keepX # set the optimal values of features to retain
+list.keepX
+```
+
+* **Final model**
+
+The final **DIABLO** model is run as:
+
+```{r}
+# set the optimised DIABLO model
+final.diablo.model = block.splsda(X = data,
+                                  Y = Y,
+                                  ncomp = ncomp,
+                                  keepX = list.keepX,
+                                  design = design)
+```
+
+The warning message informs us that the outcome y has been included automatically in the design, so that the covariance between each block's component and the outcome is maximised, as shown in the final design output.
+
+```{r}
+final.diablo.model$design # design matrix for the final model
+```
+
+The selected variables can be extracted with the function *selectVar()*, for example in the mRNA block. 
+
+```{r}
+# the features selected to form the first component
+selectVar(final.diablo.model, block = 'mRNA', comp = 1)$mRNA$name
+selectVar(final.diablo.model, block = 'miRNA', comp = 1)$miRNA$name
+selectVar(final.diablo.model, block = 'proteomics', comp = 1)$proteomics$name
+```
+
+* **Plots**
+
+```{r}
+plotDiablo(final.diablo.model, ncomp = 1)
+```
+
+**What do you observe?**
+
+The sample plot with the *plotIndiv()* function projects each sample into the space spanned by the components of each block. Clustering of the samples can be better assessed with this plot.
+
+```{r}
+plotIndiv(final.diablo.model,
+          ind.names = FALSE,
+          legend = TRUE, 
+          title = 'DIABLO Sample Plots')
+#.rs.restartR()
+```
+
+**Which clusterings do you consider to be of the highest and lowest quality?**
+
+It seems that the quality of clustering of the mRNA data is the highest with the miRNA clustering quality being the lowest. This suggests that the mRNA is likely to hold more discriminative power within the model.
+
+
+The function plotLoadings() visualises the loading weights of each selected variable on each component and each data set.
+```{r}
+plotLoadings(final.diablo.model, comp = 2, contrib = 'max', method = 'median')
+```
+
+**What information can you extract from these plots?**

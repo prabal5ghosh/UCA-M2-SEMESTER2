@@ -1,0 +1,259 @@
+---
+title: "Metabolomics data"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  html_notebook:
+    toc: true
+---
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+suppressWarnings({
+library(dplyr)
+library(tidyverse)
+library(data.table)
+library(caret)
+library(FSelector)
+library(olsrr)
+library(smotefamily)
+library(kernlab)
+})
+```
+
+
+```{r}
+df_meta <- fread('C:\\Users\\sonai\\Omics notebooks\\breast_metabolomics.csv')
+```
+
+
+```{r}
+head(df_meta)
+```
+```{r}
+df_meta <- df_meta %>% 
+  mutate(Label = as.factor(Label)) 
+```
+
+```{r}
+head(df_meta)
+```
+
+
+```{r}
+str(df_meta)
+```
+
+These are the dimensions of the dataframes.
+```{r}
+dim(df_meta)
+```
+
+There are no missing values in any of the dataframes.
+```{r}
+sum(is.na(df_meta))
+```
+
+The labels for the data is very imbalanced.
+
+```{r}
+sum(df_meta$Label == 0)
+sum(df_meta$Label == 1)
+sum(df_meta$Label == 1) / (sum(df_meta$Label == 1)+sum(df_meta$Label == 0))
+```
+
+
+# 1 Feature Selection Methods
+
+# 1.1 Information gain
+
+Information gain is mainly used for continuous target variables, so we won't consider it too much later.
+
+```{r}
+ig_weights <- information.gain(Label ~ ., data = df_meta)
+ig_weights <- ig_weights[order(ig_weights$attr_importance, decreasing = TRUE),, drop=FALSE]
+print(ig_weights)
+```
+
+## 1.2 Chi-square test
+
+We select the top 50 features
+```{r}
+chisq_weights <- chi.squared(Label ~ ., data = df_meta)
+chisq_weights <- chisq_weights[order(chisq_weights$attr_importance, decreasing = TRUE),, drop=FALSE]
+print(chisq_weights[1:50, , drop=FALSE])
+```
+
+## 1.3 Recursive feature elimination
+
+```{r}
+x <- df_meta[, -1]
+y <- df_meta$Label
+
+control_rfe <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+
+rfe_results <- rfe(x, y, sizes = c(50), rfeControl = control_rfe)
+
+#Select top 50 features
+selected_features_rfe <- predictors(rfe_results)
+print(selected_features_rfe)
+```
+
+We see that among the top 50 features from both methods, 24 are common in both.
+
+```{r}
+top50_features <- rownames(chisq_weights[1:50, , drop = FALSE])
+
+common_features <- intersect(selected_features_rfe, top50_features)
+
+print(common_features)
+```
+```{r}
+diff_features <- setdiff(selected_features_rfe, top50_features)
+print(diff_features)
+```
+# 2. Feature extraction methods
+
+# 2.1. PCA
+
+```{r}
+pca_model <- prcomp(x, center = TRUE, scale. = TRUE)
+
+var_explained <- summary(pca_model)$importance[3, ]
+n_pc <- min(which(var_explained >= 0.75))
+cat("Number of Principle Components to explain 75% variance:", n_pc, "\n")
+
+```
+```{r}
+pca_data <- data.frame(pca_model$x[, 1:n_pc])
+pca_data$Label <- df_meta$Label
+```
+
+```{r}
+dim(pca_data)
+```
+
+
+# 2.2 Kernel PCA
+
+We use the rbf kernel here.
+
+```{r}
+kpca_model <- kpca(~., data=as.data.frame(x), kernel='rbfdot', features=30)
+```
+
+```{r}
+kpca_features <- rotated(kpca_model)
+dim(kpca_features)
+```
+```{r}
+df_kpca <- data.frame(kpca_features, Label = y)
+dim(df_kpca)
+```
+
+# 3. Classification
+
+We will use random forest as our classification method and the metrics will be the AUC, sensitivity and specificity. We will employ a 5-fold cross validation and do upsampling since the classes are very imbalanced here. We will compare with the features obtained from feature selection and feature extraction.
+
+```{r}
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              sampling = "up",
+                              summaryFunction = twoClassSummary,
+                              classProbs = TRUE)
+```
+
+## 3.1 Using random forest and chi square features
+
+```{r}
+top_chi_features <- rownames(chisq_weights)[1:50]
+
+# Create new dataframe with selected features
+data_chi <- df_meta %>%
+  select(all_of(top_chi_features), Label)
+
+data_chi <- data_chi %>%
+  mutate(Label = factor(Label,
+                       levels = c(0, 1),
+                       labels = c("Class0", "Class1")))
+
+model_chi <- train(Label ~ ., data = data_chi,
+                   method = "rf",
+                   metric = "ROC",
+                   trControl = train_control)
+print(model_chi)
+```
+## 3.2 Using random forest and rfe features
+
+```{r}
+data_rfe <- df_meta %>%
+  select(all_of(selected_features_rfe), Label)
+
+data_rfe <- data_rfe %>%
+  mutate(Label = factor(Label,
+                       levels = c(0, 1),
+                       labels = c("Class0", "Class1")))
+
+model_rfe <- train(Label ~ ., data = data_rfe,
+                   method = "rf",
+                   metric = "ROC",
+                   trControl = train_control)
+print(model_rfe)
+
+```
+## 3.3 Using random forest and pca features
+
+```{r}
+pca_data <- pca_data %>%
+  mutate(Label = factor(Label,
+                       levels = c(0, 1),
+                       labels = c("Class0", "Class1")))
+
+model_pca <- train(Label ~ ., data = pca_data,
+                   method = "rf",
+                   metric = "ROC",
+                   trControl = train_control)
+print(model_pca)
+```
+## 3.4 Using random forest and kernel pca features
+
+```{r}
+df_kpca <- df_kpca %>%
+  mutate(Label = factor(Label,
+                       levels = c(0, 1),
+                       labels = c("Class0", "Class1")))
+
+model_kpca <- train(Label ~ ., data = df_kpca,
+                   method = "rf",
+                   metric = "ROC",
+                   trControl = train_control)
+
+print(model_kpca)
+
+```
+
+
+# 4. Feature importance
+
+## 4.1 Feature importance from chi square model
+
+```{r}
+importance_chi <- varImp(model_chi)
+print(importance_chi)
+
+```
+
+
+## 4.2 Feature importance from rfe model
+
+```{r}
+importance_rfe <- varImp(model_rfe)
+print(importance_rfe)
+
+```
+
+
+
+
+
+
