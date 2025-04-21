@@ -11,3 +11,8 @@ Inverse problems in biological imaging/TD 7/datasets/MNIST/MNIST/raw/t10k-labels
 Inverse problems in biological imaging/TD 7/datasets/MNIST/MNIST/raw/t10k-labels-idx1-ubyte
 Inverse problems in biological imaging/TD 7/datasets/MNIST/MNIST/raw/t10k-images-idx3-ubyte.gz
 Inverse problems in biological imaging/TD 7/datasets/MNIST/MNIST/raw/t10k-images-idx3-ubyte
+*.mat
+*.csv
+*.tsv
+*.rds
+*.pptx
